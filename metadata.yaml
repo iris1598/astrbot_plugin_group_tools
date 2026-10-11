@@ -1,0 +1,10 @@
+name: astrbot_plugin_group_tools
+display_name: OneBot 群管理工具
+desc: 为 OneBot v11 (aiocqhttp) 提供分群开关的群管理 LLM 工具集：群名片、群头衔、禁言、群精华、群公告、群相册、群头像、表情回应、戳一戳、群文件、语音转文字。
+short_desc: OneBot v11 群管理 LLM 工具集，支持分群启用功能。
+version: v1.0.0
+author: your-name
+repo: https://github.com/your-name/astrbot_plugin_group_tools
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.10.4"
