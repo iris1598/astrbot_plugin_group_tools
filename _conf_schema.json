@@ -11,6 +11,36 @@
     "default": true,
     "hint": "开启后，用户发语音、或回复一条语音消息时，会在请求大模型前自动调用协议端 voice_msg_to_text，把转写文本注入上下文（还能在下面的分群开关里按群关闭）。"
   },
+  "ban_fallback": {
+    "description": "真禁言失败时的回退",
+    "type": "string",
+    "options": [
+      "permission",
+      "any",
+      "off"
+    ],
+    "default": "permission",
+    "hint": "机器人没有权限做真禁言时怎么处理。permission = 只在看起来是权限不足时回退成软禁言（默认）；any = 只要真禁言失败就回退；off = 不回退，直接报错。软禁言只阻断该用户触发大模型回复，不调用平台禁言接口。"
+  },
+  "max_ban_seconds": {
+    "description": "模型禁言时长上限（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "只约束模型调用禁言工具时的时长：时长由模型自主决定，超过这个上限会被截断。默认 300 秒（5 分钟）。管理员用 /群管 软禁言 手动设置不受此限制。"
+  },
+  "soft_mute_replies": {
+    "description": "软禁言期间的回复",
+    "type": "list",
+    "default": [
+      "（假装没听见）……",
+      "哼，现在不想理你。",
+      "（别过头去）等会儿再说吧。",
+      "我现在不想说话，还剩 {remaining}。",
+      "（捂住耳朵）不听不听。",
+      "消停一会儿再来找我吧。"
+    ],
+    "hint": "软禁言期间随机挑一条回复给该用户。支持 {remaining} 占位符，会被替换成剩余时间。"
+  },
   "unconfigured_group_policy": {
     "description": "未登记群聊的策略",
     "type": "string",

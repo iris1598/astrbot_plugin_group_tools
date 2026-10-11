@@ -11,7 +11,10 @@
 """
 
 import asyncio
+import copy
 import json
+import random
+import time
 from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
@@ -91,6 +94,67 @@ DEFAULT_MEMBER_TOOLS: tuple[str, ...] = (
     "onebot_get_group_shut_list",
 )
 
+# 软禁言（只阻断该用户触发大模型，不调用平台禁言接口）的持久化键
+_SOFT_MUTE_KEY = "soft_mutes"
+
+# 软禁言时随机挑一条回复，支持 {remaining} 占位符
+DEFAULT_SOFT_MUTE_REPLIES: tuple[str, ...] = (
+    "（假装没听见）……",
+    "哼，现在不想理你。",
+    "（别过头去）等会儿再说吧。",
+    "我现在不想说话，还剩 {remaining}。",
+    "（捂住耳朵）不听不听。",
+    "消停一会儿再来找我吧。",
+)
+
+# 协议端常见的「权限不足」返回码
+_PERMISSION_RETCODES = frozenset({1200, 1400, 1401, 1403, 1404})
+
+# 「权限不足」报错里常见的字样（英文统一小写后匹配）
+_PERMISSION_HINTS = (
+    "权限",
+    "管理员",
+    "群主",
+    "拒绝",
+    "禁言失败",
+    "不能禁言",
+    "permission",
+    "forbidden",
+    "denied",
+    "unauthorized",
+    "not admin",
+    "not enough",
+)
+
+
+def _is_permission_error(exc: BaseException) -> bool:
+    """判断协议端报错是不是「权限不足」。
+
+    Args:
+        exc: call_action 抛出的异常。
+
+    Returns:
+        True 表示看起来是权限问题。
+    """
+    retcode = getattr(exc, "retcode", None)
+    if isinstance(retcode, int) and retcode in _PERMISSION_RETCODES:
+        return True
+    text = f"{exc}".lower()
+    return any(hint in text for hint in _PERMISSION_HINTS)
+
+
+def _format_remaining(seconds: float) -> str:
+    """把剩余秒数格式化成人话。"""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total} 秒"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {secs} 秒" if secs else f"{minutes} 分钟"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes} 分" if minutes else f"{hours} 小时"
+
+
 # build_main_agent 生成的音频占位符前缀，转写成功后会把这些占位符换成真实文本
 _AUDIO_PLACEHOLDER_PREFIXES = (
     "[Audio Attachment:",
@@ -151,7 +215,10 @@ _PARAMS: dict[str, dict] = {
         "type": "object",
         "properties": {
             "user_id": _s("要被禁言的成员 QQ 号。"),
-            "duration": _i("禁言时长（秒）。传 0 表示解除禁言。"),
+            "duration": _i(
+                "禁言时长（秒），由你根据情节轻重自主决定，超过插件上限会被自动截断；"
+                "传 0 表示解除禁言。",
+            ),
         },
         "required": ["user_id", "duration"],
     },
@@ -625,6 +692,7 @@ class _GroupTool(FunctionTool[AstrAgentContext]):
     default_message_id: bool = False
     default_user_to_sender: bool = False
     default_user_to_self: bool = False
+    clamp_duration: bool = False
 
     async def call(
         self,
@@ -699,13 +767,34 @@ async def _execute_tool(
             if stripped.lstrip("-").isdigit():
                 params[key] = int(stripped)
 
+    # 禁言时长由模型自主决定，但统一按 max_ban_seconds 截断
+    duration_note = ""
+    if tool.clamp_duration:
+        try:
+            requested = int(params.get("duration") or 0)
+        except (TypeError, ValueError):
+            return "error: duration 必须是整数秒数。"
+        if requested > 0:
+            applied = min(requested, plugin.max_ban_seconds)
+            params["duration"] = applied
+            if applied != requested:
+                duration_note = (
+                    f"（禁言上限 {plugin.max_ban_seconds} 秒，"
+                    f"你请求的 {requested} 秒已截断为 {applied} 秒）"
+                )
+        else:
+            params["duration"] = 0
+
     try:
         result = await call_action(tool.action, **params)
     except Exception as exc:  # noqa: BLE001 - 协议端错误统一转成 LLM 可读文本
         logger.warning(f"[{PLUGIN_NAME}] 调用 {tool.action} 失败，参数={params}：{exc}")
+        fallback = await plugin.soft_mute_fallback(tool, params, exc)
+        if fallback is not None:
+            return duration_note + fallback
         return f"error: 调用 {tool.action} 失败：{exc}"
 
-    return _format_result(tool.formatter, tool.action, result)
+    return duration_note + _format_result(tool.formatter, tool.action, result)
 
 
 # ---------------------------------------------------------------------------
@@ -745,15 +834,19 @@ class SetGroupSpecialTitleTool(_GroupTool):
 @dataclass
 class SetGroupBanTool(_GroupTool):
     name: str = "onebot_set_group_ban"
+    # 描述会在插件初始化时按配置的上限重写，见 GroupToolsPlugin._build_tools()
     description: str = (
-        "禁言当前群里的某个成员。duration 是禁言秒数，传 0 表示解除禁言。"
-        "常见时长：60（1 分钟）、600（10 分钟）、3600（1 小时）、86400（1 天）。"
+        "禁言当前群里的某个成员。duration 是禁言秒数，由你根据情节轻重自主决定，"
+        "超过上限会被自动截断；传 0 表示解除禁言。"
+        "如果机器人没有权限做真禁言，会自动回退成软禁言（只让机器人不回复该用户），"
+        "返回值里会说明实际生效的是哪一种。"
     )
     parameters: dict = Field(default_factory=lambda: _PARAMS["set_group_ban"])
     feature: str = "mute"
     action: str = "set_group_ban"
     write: bool = True
     formatter: str = "ok"
+    clamp_duration: bool = True
 
 
 @dataclass
@@ -1183,13 +1276,44 @@ class GroupToolsPlugin(Star):
 
         self.config: AstrBotConfig | dict = config if config is not None else {}
 
+        # 软禁言表：{群号: {QQ号: 到期时间戳}}，首次访问时从插件 KV 存储懒加载
+        self._soft_mutes: dict[str, dict[str, float]] | None = None
+
         if self._config_bool("enable_llm_tools", True):
-            self.context.add_llm_tools(*(tool_cls() for tool_cls in _TOOL_CLASSES))
+            tools = self._build_tools()
+            self.context.add_llm_tools(*tools)
             self.logger.info(
-                f"[{PLUGIN_NAME}] 已注册 {len(_TOOL_CLASSES)} 个群管理 LLM 工具。",
+                f"[{PLUGIN_NAME}] 已注册 {len(tools)} 个群管理 LLM 工具"
+                f"（禁言上限 {self.max_ban_seconds} 秒）。",
             )
         else:
             self.logger.info(f"[{PLUGIN_NAME}] 已关闭 LLM 工具注册。")
+
+    def _build_tools(self) -> list["_GroupTool"]:
+        """实例化全部工具，并把「禁言时长上限」写进相关描述里。
+
+        Returns:
+            工具实例列表。
+        """
+        tools = [tool_cls() for tool_cls in _TOOL_CLASSES]
+        limit = self.max_ban_seconds
+        for tool in tools:
+            if not tool.clamp_duration:
+                continue
+            tool.description = (
+                "禁言当前群里的某个成员。duration 是禁言秒数，由你根据情节轻重自主决定，"
+                f"最长 {limit} 秒（{_format_remaining(limit)}），超过会被自动截断；"
+                "传 0 表示解除禁言。"
+                "如果机器人没有权限做真禁言，会自动回退成软禁言（只让机器人不回复该用户），"
+                "返回值里会说明实际生效的是哪一种。"
+            )
+            # 参数 schema 是模块级共享对象，改描述前先深拷贝，避免污染其它实例
+            tool.parameters = copy.deepcopy(tool.parameters)
+            tool.parameters["properties"]["duration"]["description"] = (
+                f"禁言时长（秒），由你根据情节轻重自主决定，最长 {limit} 秒；"
+                "传 0 表示解除禁言。"
+            )
+        return tools
 
     # ------------------------------------------------------------------
     # 配置读写
@@ -1300,6 +1424,216 @@ class GroupToolsPlugin(Star):
         if not bool(entry.get(feature, True)):
             return False, f"功能「{label}」未在当前群启用。"
         return True, ""
+
+    # ------------------------------------------------------------------
+    # 软禁言
+    # 真禁言（set_group_ban）因为机器人权限不够而失败时，回退成「软禁言」：
+    # 只记录一条到期时间，在 on_llm_request 阶段阻断该用户触发大模型，
+    # 不调用平台禁言接口、也不使用任何标签方案。
+    # ------------------------------------------------------------------
+
+    @property
+    def ban_fallback(self) -> str:
+        """真禁言失败时的回退策略：permission / any / off。"""
+        return self._config_choice(
+            "ban_fallback", {"permission", "any", "off"}, "permission"
+        )
+
+    @property
+    def max_ban_seconds(self) -> int:
+        """禁言时长上限（真禁言与软禁言共用）。"""
+        value = self.config.get("max_ban_seconds")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 300
+        return parsed if parsed > 0 else 300
+
+    @property
+    def soft_mute_replies(self) -> list[str]:
+        """软禁言期间随机回复的候选文本。"""
+        raw = self.config.get("soft_mute_replies")
+        if not isinstance(raw, list):
+            return list(DEFAULT_SOFT_MUTE_REPLIES)
+        replies = [
+            item.strip() for item in raw if isinstance(item, str) and item.strip()
+        ]
+        return replies or list(DEFAULT_SOFT_MUTE_REPLIES)
+
+    async def _soft_mute_data(self) -> dict[str, dict[str, float]]:
+        """读取软禁言表（首次访问时从插件 KV 存储加载）。"""
+        if self._soft_mutes is not None:
+            return self._soft_mutes
+
+        data: dict[str, dict[str, float]] = {}
+        try:
+            raw = await self.get_kv_data(_SOFT_MUTE_KEY, {})
+        except Exception as exc:  # noqa: BLE001 - 存储不可用时退化成内存态
+            self.logger.warning(f"[{PLUGIN_NAME}] 读取软禁言数据失败：{exc}")
+            raw = {}
+        if isinstance(raw, dict):
+            for group_id, users in raw.items():
+                if not isinstance(users, dict):
+                    continue
+                cleaned = {
+                    str(user_id): float(until)
+                    for user_id, until in users.items()
+                    if isinstance(until, (int, float))
+                }
+                if cleaned:
+                    data[str(group_id)] = cleaned
+        self._soft_mutes = data
+        return data
+
+    async def _save_soft_mutes(self) -> None:
+        """把软禁言表写回插件 KV 存储。"""
+        try:
+            await self.put_kv_data(_SOFT_MUTE_KEY, self._soft_mutes or {})
+        except Exception as exc:  # noqa: BLE001 - 保存失败不影响本轮对话
+            self.logger.warning(f"[{PLUGIN_NAME}] 保存软禁言数据失败：{exc}")
+
+    async def soft_mute_remaining(self, group_id: str, user_id: str) -> float:
+        """查询某个用户在当前群的软禁言剩余秒数（顺带清理过期项）。"""
+        data = await self._soft_mute_data()
+        users = data.get(str(group_id))
+        if not users:
+            return 0.0
+        now = time.time()
+        expired = [uid for uid, until in users.items() if until <= now]
+        for uid in expired:
+            users.pop(uid, None)
+        if not users:
+            data.pop(str(group_id), None)
+        if expired:
+            await self._save_soft_mutes()
+        until = users.get(str(user_id))
+        return max(0.0, until - now) if until else 0.0
+
+    async def soft_mute(self, group_id: str, user_id: str, seconds: int) -> float:
+        """给某个用户加软禁言。
+
+        这里不做时长上限限制：上限只约束模型调用禁言工具的路径
+        （见 _execute_tool 的 clamp_duration），管理员手动指令不受限制。
+
+        Args:
+            group_id: 群号。
+            user_id: 目标用户 QQ 号。
+            seconds: 时长（秒），最小 1 秒。
+
+        Returns:
+            到期时间戳。
+        """
+        capped = max(1, int(seconds))
+        data = await self._soft_mute_data()
+        until = time.time() + capped
+        data.setdefault(str(group_id), {})[str(user_id)] = until
+        await self._save_soft_mutes()
+        return until
+
+    async def unmute(self, group_id: str, user_id: str) -> bool:
+        """解除某个用户的软禁言，返回是否真的解除了。"""
+        data = await self._soft_mute_data()
+        users = data.get(str(group_id))
+        if not users or str(user_id) not in users:
+            return False
+        users.pop(str(user_id), None)
+        if not users:
+            data.pop(str(group_id), None)
+        await self._save_soft_mutes()
+        return True
+
+    async def list_muted(self, group_id: str) -> list[tuple[str, float]]:
+        """列出当前群仍在软禁言中的用户及剩余秒数。"""
+        data = await self._soft_mute_data()
+        now = time.time()
+        users = data.get(str(group_id)) or {}
+        return sorted(
+            ((uid, until - now) for uid, until in users.items() if until > now),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+    async def soft_mute_fallback(
+        self,
+        tool: "_GroupTool",
+        params: dict[str, Any],
+        exc: BaseException,
+    ) -> str | None:
+        """真禁言失败时尝试回退成软禁言。
+
+        Args:
+            tool: 正在执行的工具。
+            params: 已经组装好的 OneBot 参数。
+            exc: 协议端抛出的异常。
+
+        Returns:
+            回退成功时返回给 LLM 的说明文本；不适用回退时返回 None。
+        """
+        if tool.action != "set_group_ban" or self.ban_fallback == "off":
+            return None
+        if self.ban_fallback == "permission" and not _is_permission_error(exc):
+            return None
+
+        group_id = str(params.get("group_id") or "").strip()
+        user_id = str(params.get("user_id") or "").strip()
+        try:
+            seconds = int(params.get("duration") or 0)
+        except (TypeError, ValueError):
+            seconds = 0
+        # duration=0 表示解除禁言，解除失败没必要软禁言
+        if not group_id or not user_id or seconds <= 0:
+            return None
+
+        until = await self.soft_mute(group_id, user_id, seconds)
+        self.logger.info(
+            f"[{PLUGIN_NAME}] 真禁言失败，已回退软禁言：group={group_id} user={user_id} {seconds}s",
+        )
+        return (
+            f"真禁言失败（{exc}），已自动回退为软禁言："
+            f"{user_id} 在接下来 {_format_remaining(seconds)} 内不会触发大模型回复"
+            f"（到 {datetime.fromtimestamp(until).strftime('%H:%M:%S')} 为止）。"
+            "软禁言不会调用平台禁言接口，只影响机器人是否回复该用户。"
+        )
+
+    @filter.on_llm_request(priority=20)
+    async def block_soft_muted(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        """被软禁言的用户不触发大模型，直接回一句敷衍话。
+
+        优先级高于语音转写钩子（10），所以被软禁言时连语音都不会去转写。
+
+        Args:
+            event: 当前消息事件。
+            req: 即将发给大模型的请求（本钩子不会用到）。
+        """
+        try:
+            group_id = str(event.get_group_id() or "").strip()
+            if not group_id:
+                return
+            allowed, _ = self.check_feature(group_id, "mute")
+            if not allowed:
+                return
+            # 管理员不受软禁言影响，否则没人能自己解除
+            if event.is_admin():
+                return
+
+            user_id = str(event.get_sender_id() or "").strip()
+            if not user_id:
+                return
+            remaining = await self.soft_mute_remaining(group_id, user_id)
+            if remaining <= 0:
+                return
+
+            event.stop_event()
+            reply = random.choice(self.soft_mute_replies).replace(
+                "{remaining}", _format_remaining(remaining)
+            )
+            await event.send(event.plain_result(reply))
+        except Exception as exc:  # noqa: BLE001 - 钩子异常不能影响正常对话
+            self.logger.warning(f"[{PLUGIN_NAME}] 软禁言拦截失败：{exc}")
 
     # ------------------------------------------------------------------
     # 语音自动转文字
@@ -1532,6 +1866,54 @@ class GroupToolsPlugin(Star):
         """列出可用的功能类别及其 key。"""
         lines = ["可用功能类别（用 key 或中文名都可以）："]
         lines.extend(f"- {label}（{key}）" for key, label in FEATURES.items())
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @group_admin.command("软禁言")
+    async def cmd_soft_mute(self, event: AstrMessageEvent, user_id: str, seconds: int):
+        """手动软禁言，用法：/群管 软禁言 <QQ号> <秒数>。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            await event.send(event.plain_result("该指令只能在群聊中使用。"))
+            return
+        if seconds <= 0:
+            await event.send(event.plain_result("秒数必须大于 0。"))
+            return
+        until = await self.soft_mute(group_id, user_id, seconds)
+        await event.send(
+            event.plain_result(
+                f"已软禁言 {user_id}：{_format_remaining(seconds)} 内不会触发大模型回复"
+                f"（到 {datetime.fromtimestamp(until).strftime('%H:%M:%S')} 为止）。"
+            ),
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @group_admin.command("解除软禁言")
+    async def cmd_unmute(self, event: AstrMessageEvent, user_id: str):
+        """解除软禁言，用法：/群管 解除软禁言 <QQ号>。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            await event.send(event.plain_result("该指令只能在群聊中使用。"))
+            return
+        if await self.unmute(group_id, user_id):
+            await event.send(event.plain_result(f"已解除 {user_id} 的软禁言。"))
+        else:
+            await event.send(event.plain_result(f"{user_id} 当前不在软禁言中。"))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @group_admin.command("软禁言列表")
+    async def cmd_soft_mute_list(self, event: AstrMessageEvent):
+        """列出当前群仍在软禁言中的用户。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("该指令只能在群聊中使用。")
+            return
+        muted = await self.list_muted(group_id)
+        if not muted:
+            yield event.plain_result("当前群没有处于软禁言中的用户。")
+            return
+        lines = [f"当前群软禁言中 {len(muted)} 人："]
+        lines.extend(f"- {uid}：剩余 {_format_remaining(rest)}" for uid, rest in muted)
         yield event.plain_result("\n".join(lines))
 
     async def _toggle_feature(

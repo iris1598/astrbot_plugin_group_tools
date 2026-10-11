@@ -4,7 +4,10 @@
 并支持 **分群启用功能**：每个群可以单独配置允许大模型使用哪些能力。
 
 此外，语音消息**不会**注册成 LLM 工具，而是在请求大模型前自动转成文字注入上下文
-（做法参考 [astrbot_plugin_mimo_media](https://github.com/iris1598/astrbot_plugin_mimo_media) 的 `llonebot_stt` 模式）。
+（做法参考 [astrbot_plugin_mimo_media](https://github.com/iris1598/astrbot_plugin_mimo_media) 的 `llonebot_stt` 模式）；
+真禁言因权限不足失败时会自动回退成**软禁言**（机制参考
+[astrbot_plugin_favorability](https://github.com/iris1598/astrbot_plugin_favorability)，
+但**不使用**它的 `[MUTE:N]` 标签方案）。这两者都不是工具。
 
 ## 功能一览
 
@@ -51,6 +54,9 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
 | `write_tool_permission` | `admin` | 会改动内容的工具（禁言、改名、发公告、改文件、改机器人资料等）默认需要的权限。`admin` = 仅 AstrBot 管理员；`member` = 所有群成员。 |
 | `readonly_tool_permission` | `admin` | 只读查询类工具（群成员、群文件、群公告、群精华、相册列表等）默认需要的权限。默认 `admin`，即「除豁免项外全部需要管理员」。 |
 | `member_tools` | 见下 | **免管理员权限的工具**白名单，优先级高于上面两项。默认放开「设置别人群名片」和「禁言」相关工具。 |
+| `ban_fallback` | `permission` | 真禁言失败时怎么处理：`permission` 只在权限不足时回退成软禁言；`any` 任何失败都回退；`off` 不回退。 |
+| `max_ban_seconds` | `300` | **模型禁言时长上限**。只约束模型调用禁言工具时的时长，管理员手动指令不受限制。 |
+| `soft_mute_replies` | 6 条内置文案 | 软禁言期间随机回复的候选文本，支持 `{remaining}` 占位符。 |
 | `unconfigured_group_policy` | `allow` | 没有在下面列表里登记的群：`allow` 默认全开，`deny` 默认全关。 |
 | `groups` | `[]` | **分群功能开关**，每个条目包含群号、插件总开关和 10 个功能类别开关。 |
 
@@ -114,6 +120,54 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
 按群关闭：在分群开关里把 `stt` 设为关即可；全局关闭用 `enable_auto_stt`。
 私聊没有分群概念，只受 `enable_auto_stt` 控制。
 
+## 软禁言（真禁言失败时的回退）
+
+`onebot_set_group_ban` 走的是协议端真正的群禁言接口。如果机器人**没有权限**做真禁言
+（不是群主/管理员，或者要禁言的对象是群主/管理员），协议端会报错，这时插件会自动回退成
+**软禁言**——机制参考了 `astrbot_plugin_favorability` 的做法，但**不使用它的 `[MUTE:N]` 标签方案**：
+
+- 软禁言只在插件内部记一条到期时间（存在 AstrBot 的插件 KV 存储里），
+  **不会调用平台禁言接口**，对方在群里照常发言；
+- 被软禁言的用户发消息时，插件在 `on_llm_request` 阶段（priority 20）直接阻断大模型请求，
+  并随机回一句敷衍话（文案可在 `soft_mute_replies` 里改，支持 `{remaining}`）；
+- 阻断钩子优先级高于语音转写钩子，所以被软禁言时连语音都不会去转写；
+- 管理员**不受**软禁言影响，否则没人能解除；
+- 分群开关里的 `mute` 关掉后，软禁言拦截也不生效。
+
+**什么时候回退**由 `ban_fallback` 控制：
+
+| 值 | 行为 |
+| --- | --- |
+| `permission`（默认） | 只有报错看起来是权限问题（retcode 1200/1400/1401/1403/1404，或错误文本含「权限」「管理员」「群主」「permission」「denied」等）才回退 |
+| `any` | 只要真禁言失败就回退 |
+| `off` | 不回退，直接把协议端的错误返回给模型 |
+
+不会回退的情况：`duration=0`（那是解除禁言）、以及其它工具失败。
+
+回退成功时，工具会返回类似：
+
+```
+真禁言失败（<ActionFailed retcode=1200 ...>），已自动回退为软禁言：333 在接下来 2 分钟
+内不会触发大模型回复（到 16:58:08 为止）。软禁言不会调用平台禁言接口，只影响机器人是否回复该用户。
+```
+
+时长由模型自主决定，上限 `max_ban_seconds`（默认 300 秒）——**这条上限只约束模型**，
+管理员用 `/群管 软禁言` 手动设置不受限制。
+
+## 禁言时长：模型自主，上限 300 秒
+
+模型调用 `onebot_set_group_ban` 时，时长由它根据情节轻重**自主决定**，插件只做一件事：
+按 `max_ban_seconds`（默认 `300` 秒）截断。这条上限**只作用于模型调用工具的路径**，
+包括失败后回退成的软禁言（因为它沿用的就是模型请求的时长）。
+
+- 工具描述与 `duration` 参数说明会在插件初始化时按当前配置动态生成，
+  所以模型看到的就是实际生效的上限，例如「最长 300 秒（5 分钟），超过会被自动截断」；
+- 真的被截断时，工具返回值前面会加一句
+  `（禁言上限 300 秒，你请求的 3600 秒已截断为 300 秒）`，模型能知道自己被截了；
+- `duration = 0` 表示**解除禁言**，不会被夹成 1 秒；
+- **管理员手动指令不受限制**：`/群管 软禁言 <QQ> <秒数>` 想设多久就多久；
+- 想把模型的上限调大（比如 600 秒），改 `max_ban_seconds` 就行，描述会跟着变。
+
 ## 指令
 
 所有指令都要求 AstrBot 管理员权限（`filter.PermissionType.ADMIN`，即主配置 `admins_id` 中的 QQ）。
@@ -126,6 +180,9 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
 | `/群管 开启全部` | 开启当前群的全部功能 |
 | `/群管 关闭全部` | 关闭当前群的全部功能 |
 | `/群管 功能` | 列出可用的功能类别与 key |
+| `/群管 软禁言 <QQ号> <秒数>` | 手动软禁言某个人，**时长不受上限限制** |
+| `/群管 解除软禁言 <QQ号>` | 提前解除软禁言 |
+| `/群管 软禁言列表` | 列出当前群仍在软禁言中的用户及剩余时间 |
 
 指令组别名：`/群管理`、`/grouptools`；功能名既可以用 key（`file`），也可以用中文（`群文件`、`文件`）。
 指令的改动会立即写入配置文件，WebUI 刷新后可以看到。
@@ -155,6 +212,8 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
 
    另外 AstrBot 自身还有一层「扩展 → 组件」里的单工具权限，插件工具默认是 `member`
    （即放行，由本插件自己判定）。两层是叠加的：在那边把某个工具设成 `admin` 会更严。
+3. **软禁言不做破坏性操作**：它只是让机器人不回复该用户，不碰平台禁言状态，
+   数据存在插件 KV 存储里，到期自动清理。
 3. **分群开关在调用时校验**：功能被关掉后，工具会直接返回
    `error: 功能「群文件」未在当前群启用。`，不会调用协议端。
 4. **多账号路由**：每次调用都会带上 `self_id`，多协议端实例不会串号。
@@ -165,7 +224,7 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
 配置好之后，在群里直接跟机器人说话即可，例如：
 
 - 「把张三的群名片改成 摸鱼中」→ `onebot_set_group_card`
-- 「把李四禁言 10 分钟」→ `onebot_set_group_ban(duration=600)`
+- 「把李四禁言 5 分钟」→ `onebot_set_group_ban(duration=300)`（超过 300 秒会被截断）
 - 「这条消息设为精华」→ `onebot_set_essence_msg`（默认作用于当前消息）
 - 「看看群里有哪些文件」→ `onebot_get_group_root_files`
 - 「把你自己在本群的名字改成 小助手」→ `onebot_set_self_group_card`（`user_id` 自动填机器人自己）
@@ -186,16 +245,21 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
   `set_group_card` 改自己名片时只影响当前群。
 - 默认权限很严：普通群成员只能用「设置别人群名片」和「禁言」这几项，其余（包括查询类）都要管理员。
   如果被拦，返回的提示里会写明怎么放开。
+- 软禁言是**本插件自己**的状态，和 `astrbot_plugin_favorability` 的禁言数据互不相通；
+  两个插件同时装时，任意一边认为该用户被禁言，都会阻断他触发大模型
+  （本插件的拦截钩子优先级 20 更高，会先拦到并回自己的文案）。
 - 需要机器人本身在群里具备相应权限（群主/管理员），否则协议端会返回权限错误。
 - 列表类接口（群文件、相册、精华、公告）最多返回 50 条，避免撑爆模型上下文；
   相册媒体列表支持用 `attach_info` 翻页。
 
 ## 开发说明
 
-- `main.py`：全部实现，约 1540 行。
+- `main.py`：全部实现，约 1900 行。
 - `_conf_schema.json`：插件配置 Schema，其中 `groups` 使用 `template_list`。
 - 工具统一继承 `_GroupTool`，执行逻辑集中在 `_execute_tool()`：
   平台检查 → 分群开关检查 → 权限检查 → 组装参数（补 `group_id` / `self_id` / 默认 `message_id`）
-  → 调用 `event.bot.api.call_action()` → 格式化结果。
-- 语音转写走 `on_llm_request` 钩子，相关方法：`_collect_audio_targets()` →
+  → 调用 `event.bot.api.call_action()` → 格式化结果；失败时先尝试 `soft_mute_fallback()`。
+- 语音转写走 `on_llm_request` 钩子（priority 10），相关方法：`_collect_audio_targets()` →
   `_transcribe_audio()` → `_inject_transcriptions()`，消息链递归由模块级 `_walk_components()` 完成。
+- 软禁言拦截也走 `on_llm_request` 钩子（priority 20，先于语音转写），
+  数据由 `soft_mute()` / `unmute()` / `list_muted()` / `soft_mute_remaining()` 维护。
