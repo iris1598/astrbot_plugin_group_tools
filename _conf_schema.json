@@ -21,11 +21,36 @@
     "default": "allow",
     "hint": "allow：未在「分群功能开关」中登记的群默认启用全部功能；deny：默认全部禁用。"
   },
-  "require_admin_for_write": {
-    "description": "写操作仅限管理员",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，禁言、改名、删文件等写操作只允许 AstrBot 管理员（主配置 admins_id 中的 QQ）触发；只读查询不受限制。"
+  "write_tool_permission": {
+    "description": "写操作默认权限",
+    "type": "string",
+    "options": [
+      "admin",
+      "member"
+    ],
+    "default": "admin",
+    "hint": "会改动内容的工具（禁言、改名、发公告、改文件、改机器人资料等）默认需要的权限。admin = 仅 AstrBot 管理员（主配置 admins_id 中的 QQ）；member = 所有群成员。"
+  },
+  "readonly_tool_permission": {
+    "description": "只读查询默认权限",
+    "type": "string",
+    "options": [
+      "admin",
+      "member"
+    ],
+    "default": "admin",
+    "hint": "只读查询类工具（获取群成员、群文件、群公告、群精华、相册列表等）默认需要的权限。默认 admin 表示「除下面豁免项外全部需要管理员」；想让普通成员也能查询就改成 member。"
+  },
+  "member_tools": {
+    "description": "免管理员权限的工具",
+    "type": "list",
+    "default": [
+      "onebot_set_group_card",
+      "onebot_set_group_ban",
+      "onebot_set_group_whole_ban",
+      "onebot_get_group_shut_list"
+    ],
+    "hint": "列在这里的工具普通群成员也能用，不受上面两项默认权限影响。默认放开「设置别人群名片」与「禁言」相关工具。可填的工具名见插件 README 的功能表。"
   },
   "groups": {
     "type": "template_list",
@@ -101,6 +126,12 @@
             "type": "bool",
             "default": true,
             "hint": "用户发语音或回复语音时，自动调用协议端 voice_msg_to_text 把语音转成文字注入上下文。"
+          },
+          "self": {
+            "description": "机器人自身",
+            "type": "bool",
+            "default": true,
+            "hint": "修改机器人在当前群的名片（自己的群名片）、以及机器人自己的 QQ 头像。"
           }
         }
       }

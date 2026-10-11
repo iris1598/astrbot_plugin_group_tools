@@ -8,7 +8,7 @@
 
 ## 功能一览
 
-共 **30 个 LLM 工具**，按 9 个功能类别分组，每类都可以在 WebUI 里按群开关；
+共 **32 个 LLM 工具**，按 10 个功能类别分组，每类都可以在 WebUI 里按群开关；
 其中「语音自动转文字」是通过 `on_llm_request` 钩子实现的，不是工具。
 
 | 功能类别 | key | 工具（LLM 工具名） | 对应 OneBot action |
@@ -22,9 +22,14 @@
 | 互动 | `interact` | `onebot_set_msg_emoji_like`<br>`onebot_send_poke` | `set_msg_emoji_like`<br>`send_poke` |
 | 群文件 | `file` | `onebot_upload_group_file`<br>`onebot_set_group_file_forever`<br>`onebot_delete_group_file`<br>`onebot_move_group_file`<br>`onebot_create_group_file_folder`<br>`onebot_delete_group_file_folder`<br>`onebot_get_group_file_system_info`<br>`onebot_get_group_root_files`<br>`onebot_get_group_files_by_folder`<br>`onebot_rename_group_file_folder`<br>`onebot_rename_group_file` | `upload_group_file`<br>`set_group_file_forever`<br>`delete_group_file`<br>`move_group_file`<br>`create_group_file_folder`<br>`delete_group_folder`<br>`get_group_file_system_info`<br>`get_group_root_files`<br>`get_group_files_by_folder`<br>`rename_group_file_folder`<br>`rename_group_file` |
 | 语音自动转文字 | `stt` | ——（`on_llm_request` 钩子自动注入，无工具） | `voice_msg_to_text` |
+| 机器人自身 | `self` | `onebot_set_self_group_card`<br>`onebot_set_qq_avatar` | `set_group_card`（`user_id` 自动填机器人自己）<br>`set_qq_avatar` |
 
 > 接口参数以 NapCat / OneBot v11 的字段名为准，例如 `set_group_special_title` 用 `special_title`，
 > `create_group_file_folder` 用 `name`，`delete_group_folder` 对应工具 `onebot_delete_group_file_folder`。
+
+> 「机器人自身」这一类的两个工具都不需要传 QQ 号：
+> `onebot_set_self_group_card` 自动把 `user_id` 填成机器人自己（改的是它在**当前群**的名片），
+> `onebot_set_qq_avatar` 改的是机器人账号的**个人头像**（不是群头像，群头像用 `onebot_set_group_portrait`）。
 
 ## 安装
 
@@ -41,11 +46,24 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `enable_llm_tools` | `true` | 是否把这 30 个工具注册给大模型。关闭后只保留 `/群管` 指令。修改后需要重载插件。 |
+| `enable_llm_tools` | `true` | 是否把这 32 个工具注册给大模型。关闭后只保留 `/群管` 指令。修改后需要重载插件。 |
 | `enable_auto_stt` | `true` | 语音自动转文字的全局总开关。关闭后完全不做语音转写。 |
+| `write_tool_permission` | `admin` | 会改动内容的工具（禁言、改名、发公告、改文件、改机器人资料等）默认需要的权限。`admin` = 仅 AstrBot 管理员；`member` = 所有群成员。 |
+| `readonly_tool_permission` | `admin` | 只读查询类工具（群成员、群文件、群公告、群精华、相册列表等）默认需要的权限。默认 `admin`，即「除豁免项外全部需要管理员」。 |
+| `member_tools` | 见下 | **免管理员权限的工具**白名单，优先级高于上面两项。默认放开「设置别人群名片」和「禁言」相关工具。 |
 | `unconfigured_group_policy` | `allow` | 没有在下面列表里登记的群：`allow` 默认全开，`deny` 默认全关。 |
-| `require_admin_for_write` | `true` | 写操作（禁言、改名、删文件等）只允许 AstrBot 管理员触发。 |
-| `groups` | `[]` | **分群功能开关**，每个条目包含群号、插件总开关和 9 个功能类别开关。 |
+| `groups` | `[]` | **分群功能开关**，每个条目包含群号、插件总开关和 10 个功能类别开关。 |
+
+`member_tools` 的默认值：
+
+```json
+[
+  "onebot_set_group_card",
+  "onebot_set_group_ban",
+  "onebot_set_group_whole_ban",
+  "onebot_get_group_shut_list"
+]
+```
 
 ### 分群功能开关示例
 
@@ -66,13 +84,15 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
       "portrait": true,
       "interact": true,
       "file": false,
-      "stt": true
+      "stt": true,
+      "self": true
     }
   ]
 }
 ```
 
 上面这个例子的含义是：群 `123456789` 启用本插件，但**不允许**大模型操作群文件，其余功能开放。
+把 `self` 设为 `false`，就是禁止大模型改机器人在这个群的名片和它自己的 QQ 头像。
 
 ## 语音自动转文字
 
@@ -114,9 +134,27 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
 
 1. **只作用于当前群**：所有工具都不接受 LLM 传入的 `group_id`，群号一律取当前会话所在群。
    这样可以避免提示词注入诱导模型去操作别的群。
-2. **写操作默认仅管理员**：`require_admin_for_write = true` 时，非管理员只能调用只读查询类工具。
-   如需更细粒度控制，也可以在 WebUI「扩展 → 组件」里把个别工具单独设为 `admin` 权限
-   （插件工具默认是 `member`）。
+2. **默认全部需要管理员，只放开两项**：`write_tool_permission` 与 `readonly_tool_permission`
+   默认都是 `admin`，也就是说**除 `member_tools` 白名单外的 28 个工具都只允许 AstrBot 管理员调用**
+   （含只读查询类）。默认白名单是：
+
+   | 工具 | 说明 |
+   | --- | --- |
+   | `onebot_set_group_card` | 设置**别人**的群名片 |
+   | `onebot_set_group_ban` | 群禁言 |
+   | `onebot_set_group_whole_ban` | 群全体禁言 |
+   | `onebot_get_group_shut_list` | 获取被禁言群员列表 |
+
+   注意：`onebot_set_self_group_card`（改机器人**自己**的群名片）和 `onebot_set_qq_avatar`
+   （改机器人头像）**不在**白名单里，仍然需要管理员。
+
+   调整方式：
+   - 想让普通成员也能查询群信息 → `readonly_tool_permission` 改成 `member`；
+   - 想让普通成员也能执行全部写操作 → `write_tool_permission` 改成 `member`；
+   - 想单独放开某个工具 → 把工具名加进 `member_tools`。
+
+   另外 AstrBot 自身还有一层「扩展 → 组件」里的单工具权限，插件工具默认是 `member`
+   （即放行，由本插件自己判定）。两层是叠加的：在那边把某个工具设成 `admin` 会更严。
 3. **分群开关在调用时校验**：功能被关掉后，工具会直接返回
    `error: 功能「群文件」未在当前群启用。`，不会调用协议端。
 4. **多账号路由**：每次调用都会带上 `self_id`，多协议端实例不会串号。
@@ -130,6 +168,8 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
 - 「把李四禁言 10 分钟」→ `onebot_set_group_ban(duration=600)`
 - 「这条消息设为精华」→ `onebot_set_essence_msg`（默认作用于当前消息）
 - 「看看群里有哪些文件」→ `onebot_get_group_root_files`
+- 「把你自己在本群的名字改成 小助手」→ `onebot_set_self_group_card`（`user_id` 自动填机器人自己）
+- 「换个头像」→ `onebot_set_qq_avatar`
 - 回复一条语音后说「他刚才说了什么」→ 无需工具，转写文本已经自动注入上下文
 
 ## 注意事项
@@ -140,15 +180,19 @@ git clone <本插件仓库地址> astrbot_plugin_group_tools
   协议端不支持时会在日志里记录 `voice_msg_to_text 失败` 并回退为原始音频。
 - 相册、群公告、群文件等接口是 NapCat / Lagrange 的扩展接口，
   不同协议端实现程度不同；如果协议端不支持，会返回 `error: 调用 xxx 失败：...`。
-- `upload_group_file`、`set_group_portrait`、`upload_group_album` 的路径参数是
+- `upload_group_file`、`set_group_portrait`、`upload_group_album`、`set_qq_avatar` 的路径参数是
   **协议端所在机器**上的路径，不是 AstrBot 容器内的路径；跨容器部署时请用 `http://` 或 `base64://`。
+- `set_qq_avatar` 改的是机器人账号的**全局头像**，影响它在所有群和私聊里的形象，所以默认要求管理员；
+  `set_group_card` 改自己名片时只影响当前群。
+- 默认权限很严：普通群成员只能用「设置别人群名片」和「禁言」这几项，其余（包括查询类）都要管理员。
+  如果被拦，返回的提示里会写明怎么放开。
 - 需要机器人本身在群里具备相应权限（群主/管理员），否则协议端会返回权限错误。
 - 列表类接口（群文件、相册、精华、公告）最多返回 50 条，避免撑爆模型上下文；
   相册媒体列表支持用 `attach_info` 翻页。
 
 ## 开发说明
 
-- `main.py`：全部实现，约 1470 行。
+- `main.py`：全部实现，约 1540 行。
 - `_conf_schema.json`：插件配置 Schema，其中 `groups` 使用 `template_list`。
 - 工具统一继承 `_GroupTool`，执行逻辑集中在 `_execute_tool()`：
   平台检查 → 分群开关检查 → 权限检查 → 组装参数（补 `group_id` / `self_id` / 默认 `message_id`）

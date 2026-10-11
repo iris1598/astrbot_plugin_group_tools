@@ -41,6 +41,7 @@ FEATURES: dict[str, str] = {
     "interact": "互动（贴表情/戳一戳）",
     "file": "群文件",
     "stt": "语音自动转文字",
+    "self": "机器人自身（名片/头像）",
 }
 
 # 指令里可以用的中文别名 -> 功能 key
@@ -68,6 +69,12 @@ FEATURE_ALIASES: dict[str, str] = {
     "语音转文字": "stt",
     "自动转文字": "stt",
     "stt": "stt",
+    "自己": "self",
+    "自身": "self",
+    "机器人": "self",
+    "个人头像": "self",
+    "自己的名片": "self",
+    "self": "self",
 }
 
 # 列表类结果最多返回多少条，避免撑爆上下文
@@ -75,6 +82,14 @@ LIST_LIMIT = 50
 
 # 递归遍历消息链（回复 / 合并转发）的最大深度
 MAX_COMPONENT_DEPTH = 8
+
+# 默认无需管理员权限的工具：设置别人群名片 + 禁言相关
+DEFAULT_MEMBER_TOOLS: tuple[str, ...] = (
+    "onebot_set_group_card",
+    "onebot_set_group_ban",
+    "onebot_set_group_whole_ban",
+    "onebot_get_group_shut_list",
+)
 
 # build_main_agent 生成的音频占位符前缀，转写成功后会把这些占位符换成真实文本
 _AUDIO_PLACEHOLDER_PREFIXES = (
@@ -301,6 +316,21 @@ _PARAMS: dict[str, dict] = {
             "new_name": _s("新的文件名。"),
         },
         "required": ["file_id", "current_parent_directory", "new_name"],
+    },
+    # ---------------- 机器人自身 ----------------
+    "set_self_group_card": {
+        "type": "object",
+        "properties": {
+            "card": _s("机器人在这一个群里的新名片。传空字符串表示取消名片。"),
+        },
+        "required": ["card"],
+    },
+    "set_qq_avatar": {
+        "type": "object",
+        "properties": {
+            "file": _s("新的 QQ 头像图片，支持 http://、file://、base64://。"),
+        },
+        "required": ["file"],
     },
 }
 
@@ -591,8 +621,10 @@ class _GroupTool(FunctionTool[AstrAgentContext]):
     formatter: str = "json"
     optional_keys: tuple[str, ...] = ()
     group_scoped: bool = True
+    inject_group_id: bool = True
     default_message_id: bool = False
     default_user_to_sender: bool = False
+    default_user_to_self: bool = False
 
     async def call(
         self,
@@ -630,10 +662,12 @@ async def _execute_tool(
         if not allowed:
             return f"error: {reason}"
 
-    if tool.write and plugin.require_admin_for_write and not event.is_admin():
+    if plugin.tool_requires_admin(tool) and not event.is_admin():
         return (
             "error: 该操作需要 AstrBot 管理员权限。"
-            f"你的 QQ 号：{event.get_sender_id()}。请让管理员在 WebUI 主配置的 admins_id 中加入该 QQ 号。"
+            f"你的 QQ 号：{event.get_sender_id()}。"
+            "请让管理员在 WebUI 主配置的 admins_id 中加入该 QQ 号，"
+            "或在插件配置的「免管理员权限的工具」里加入该工具名。"
         )
 
     params: dict[str, Any] = {
@@ -643,15 +677,19 @@ async def _execute_tool(
         if params.get(key) == "":
             params.pop(key, None)
 
+    # 多账号场景需要带上 self_id 做路由，否则会串号
+    self_id = getattr(event.message_obj, "self_id", None)
+
     if tool.default_message_id and not params.get("message_id"):
         params["message_id"] = event.message_obj.message_id
     if tool.default_user_to_sender and not params.get("user_id"):
         params["user_id"] = event.get_sender_id()
-    if group_id:
+    if tool.default_user_to_self:
+        if not self_id:
+            return "error: 无法获取机器人自身的 QQ 号（self_id），暂时无法操作机器人自己的资料。"
+        params["user_id"] = self_id
+    if group_id and tool.inject_group_id:
         params["group_id"] = group_id
-
-    # 多账号场景需要带上 self_id 做路由，否则会串号
-    self_id = getattr(event.message_obj, "self_id", None)
     if self_id:
         params.setdefault("self_id", self_id)
 
@@ -904,6 +942,7 @@ class SetMsgEmojiLikeTool(_GroupTool):
     write: bool = True
     formatter: str = "ok"
     group_scoped: bool = False
+    inject_group_id: bool = False
     optional_keys: tuple[str, ...] = ("message_id", "set")
     default_message_id: bool = True
 
@@ -920,6 +959,39 @@ class SendPokeTool(_GroupTool):
     group_scoped: bool = False
     optional_keys: tuple[str, ...] = ("user_id",)
     default_user_to_sender: bool = True
+
+
+@dataclass
+class SetSelfGroupCardTool(_GroupTool):
+    name: str = "onebot_set_self_group_card"
+    description: str = (
+        "修改机器人在当前群里的群名片（也就是机器人「自己」的群名片）。"
+        "只能在当前群聊中使用，card 传空字符串表示取消名片。"
+        "如果要改的是别人的名片，请用 onebot_set_group_card。"
+    )
+    parameters: dict = Field(default_factory=lambda: _PARAMS["set_self_group_card"])
+    feature: str = "self"
+    action: str = "set_group_card"
+    write: bool = True
+    formatter: str = "ok"
+    default_user_to_self: bool = True
+
+
+@dataclass
+class SetQqAvatarTool(_GroupTool):
+    name: str = "onebot_set_qq_avatar"
+    description: str = (
+        "修改机器人自己的 QQ 头像（个人头像，不是群头像）。"
+        "file 支持 http://、file://、base64:// 三种形式。"
+        "如果要改的是当前群的群头像，请用 onebot_set_group_portrait。"
+    )
+    parameters: dict = Field(default_factory=lambda: _PARAMS["set_qq_avatar"])
+    feature: str = "self"
+    action: str = "set_qq_avatar"
+    write: bool = True
+    formatter: str = "ok"
+    group_scoped: bool = False
+    inject_group_id: bool = False
 
 
 @dataclass
@@ -1096,6 +1168,8 @@ _TOOL_CLASSES: tuple[type[_GroupTool], ...] = (
     GetGroupFilesByFolderTool,
     RenameGroupFileFolderTool,
     RenameGroupFileTool,
+    SetSelfGroupCardTool,
+    SetQqAvatarTool,
 )
 
 
@@ -1126,10 +1200,50 @@ class GroupToolsPlugin(Star):
         value = self.config.get(key, default)
         return bool(default if value is None else value)
 
+    def _config_choice(self, key: str, options: set[str], default: str) -> str:
+        """读取枚举型配置项，取值非法时回退到默认值。"""
+        value = str(self.config.get(key) or default).strip()
+        return value if value in options else default
+
     @property
-    def require_admin_for_write(self) -> bool:
-        """写操作是否只允许 AstrBot 管理员。"""
-        return self._config_bool("require_admin_for_write", True)
+    def write_tool_permission(self) -> str:
+        """会改动内容的工具默认需要的权限：admin 或 member。"""
+        return self._config_choice(
+            "write_tool_permission", {"admin", "member"}, "admin"
+        )
+
+    @property
+    def readonly_tool_permission(self) -> str:
+        """只读查询类工具默认需要的权限：admin 或 member。"""
+        return self._config_choice(
+            "readonly_tool_permission", {"admin", "member"}, "admin"
+        )
+
+    @property
+    def member_tools(self) -> frozenset[str]:
+        """无需管理员权限的工具名集合（白名单，优先于上面的默认策略）。"""
+        raw = self.config.get("member_tools")
+        if not isinstance(raw, list):
+            raw = list(DEFAULT_MEMBER_TOOLS)
+        return frozenset(
+            item.strip() for item in raw if isinstance(item, str) and item.strip()
+        )
+
+    def tool_requires_admin(self, tool: "_GroupTool") -> bool:
+        """判断某个工具是否需要 AstrBot 管理员权限。
+
+        Args:
+            tool: 工具实例。
+
+        Returns:
+            True 表示只有 AstrBot 管理员可用；False 表示所有群成员可用。
+        """
+        if tool.name in self.member_tools:
+            return False
+        policy = (
+            self.write_tool_permission if tool.write else self.readonly_tool_permission
+        )
+        return policy == "admin"
 
     @property
     def unconfigured_group_policy(self) -> str:
